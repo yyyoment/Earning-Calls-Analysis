@@ -1,0 +1,685 @@
+---
+title: "WWE Earnings Call<br>Transcript Analysis"
+author: "[Yun (Jessica) Yan](https://yyyoment.github.io/yan-yun/archive.html)"
+date: "February 11 2020"
+mail: "yyan5@nd.edu"
+linkedin: "yan-yun"
+github: "yyyoment"
+home: "yyyoment.github.io/yan-yun/"
+bg: "stock.jpg"
+# !!! You can specify the theme color here
+color: "#c55a11"
+output:
+  ndrmd::ndrmd1:
+    toc: TRUE
+    number_sections: FALSE
+    code_folding: "show"
+---
+<style>
+div.blue {
+    background-color:rgba(197, 90, 17, 0.19); 
+    border-radius: 9px; 
+    padding: 20px;
+    font-weight:500;
+    font-size: 18px;
+}
+</style>
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE, message = FALSE,error=FALSE,fig.align="center")
+library(tidyverse)
+library(fuzzyjoin)
+library(stringdist)
+library(magrittr)
+library(tm)
+library(sentimentr)
+library(textdata)
+library(lexicon)
+library(tidytext)
+library(treemap)
+library(yarrr)
+library(ggsci)
+library(plotly)
+library(gridExtra)
+set.seed(123)
+setwd("G:/My Drive/project_yy/wweCalls")
+```
+
+<br><br>
+Earnings call is a conference call among the management of a public company, analysts, investors, and the media to discuss the company’s financial situation during a given reporting period, such as a quarter or a fiscal year.
+
+In this analysis, I dig into the WWE earnings call transcript and perform <font color="#c55a11">sentiment analysis</font> with various lexicons. In addition, I scraped WWE’s stock prices using Alpha Vantage API to explore the closing price of the 10 trading days around each call’s date and analyze the relationship between closing prices and the sentiment scores in order to find out the <font color="#c55a11">investment behavior patterns</font> based upon a call.
+
+# Data Cleansing
+
+I use functions within R (e.g., `unzip` or `unz`) to unzip the data and load the parsed data.
+
+```{r eval=FALSE}
+zipF<- "E:/Downloads/wweCalls.zip"
+outDir<-"G:/My Drive/wweCalls"
+unzip(zipF,exdir=outDir)
+```
+
+```{r}
+rm(list=ls())
+parsed <- list.files(pattern = ".*parse.*csv")
+
+wweCalls <- parsed %>%
+  lapply(read.csv, stringsAsFactors=F) %>%
+  bind_rows
+
+glimpse(wweCalls)
+```
+
+First, I dealt with the some weird name in the dataset. In addition, I converted `quarter` into numerical variables and `date` into date format for later usage.
+
+Next, I remove the *operator's and media's speeches* because I think these are just for connecting the meeting and do not contain much useful information.
+
+Besides, I grouped all the different titles into three main categories: **Analyst, Financial Lead and Management**.
+
+```{r}
+# Quarter & Date
+text_taj <- function(x) (x = ifelse(grepl('it used to be Taj',as.character(x)),NA,as.character(x)))
+
+wweCalls1 <- wweCalls %>% 
+  mutate(quarter=as.numeric(substr(quarter,2,2)),
+         date=as.Date(date,'%d-%b-%y'),
+         name=as.character(name),
+         name = ifelse(name %in% c('unidentified participant','unidentified audience member','unknown speaker','unidentified company representative','india is the other up and coming for us. we have a wonderful tv deal with zee tv. it used to be -- i think it was -- its taj','as a reminder'),NA,name),
+         firstName=as.character(firstName),
+         firstName = ifelse(is.na(name),NA,firstName),
+         firstLast=as.character(firstLast),
+         firstLast = ifelse(is.na(name),NA,firstLast),
+         organization = ifelse(organization==',',NA,as.character(organization)),) %>% 
+  mutate_at(c('organization','title'),text_taj,) 
+
+# Drop the Operator & Media
+wweCalls1 <- wweCalls1 %>% 
+  filter(firstName!='Operator')%>% 
+  filter(title!='Media')
+
+# Title
+wweCalls2 <- wweCalls1 %>% 
+  mutate(title1=ifelse(grepl('VP|Planning|IR|CFO|Financial', title),'Financial Lead',ifelse(grepl('Analyst',title),'Analyst','Management')))
+```
+
+This part is about cleansing the organization variable in the data.
+
+I notice that there are different names for the same company, which may be resulted from the manual input problems. I tried to use the string distance matrix to make the name consistent for the same company. However, I also found that there are very similar company names. For example, `Carrier Partners` and `Terrier Partners` are highly similar to each other, but actually they are two different companies. Therefore, I understand that my grouping result may not be very accurate.
+
+My solutions is to *conduct grouping twice*, the first time with a loose standard and the second time with a more strict standard. It seems to improve the misclassification situation a bit but still not perform perfectly without manual checking. I just try to make my data as clean as possible. Since the grouping result is not satisfying enough, this variable would not be used in my following analysis. 
+
+```{r}
+# Organization
+oz_df <- data.frame(organization= unique(na.omit(wweCalls2$organization)))
+
+oz_df$organization %>% 
+  tolower %>% 
+  trimws %>% 
+  str_replace_all('&amp;','and') %>% 
+  removeWords(words = c(stopwords("en"))) %>% 
+  stringdist::stringdistmatrix(method = "jaccard", q = 3.5) %>%
+  as.dist %>% 
+  `attr<-`("Labels", oz_df$organzation)%>% 
+  hclust %T>% 
+  plot %T>% 
+  rect.hclust(h = 0.3) %>% 
+  cutree(h = 0.3) %>% 
+  print -> oz_df$group
+
+oz_df$organization <- as.character(oz_df$organization)
+
+for (n in 1:max(as.integer(oz_df$group))){
+  oz_df[oz_df[,'group']==as.character(n),2] <- oz_df[oz_df[,'group']==as.character(n),][1,1]
+}
+
+## do second time to make it precise
+oz_df$organization %>% 
+  tolower %>% 
+  trimws %>% 
+  removeWords(words = c(stopwords("en"))) %>% 
+  stringdist::stringdistmatrix(method = "jw",p=0.01) %>%
+  as.dist %>% 
+  `attr<-`("Labels", oz_df$organzation)%>% 
+  hclust %T>% 
+  plot %T>% 
+  rect.hclust(h = 0.3) %>% 
+  cutree(h = 0.3) %>% 
+  print -> oz_df$group1
+
+for (n in 1:max(as.integer(oz_df$group1))){
+  oz_df[oz_df[,'group1']==as.character(n),3] <- oz_df[oz_df[,'group1']==as.character(n),][1,1]
+}
+
+oz_df['dis'] <- stringdist(oz_df$organization,oz_df$group1, method = "jw") %>% list()
+
+if ((0.2 < oz_df['dis'] && oz_df['dis']<0.221) || 0.235<oz_df['dis']){
+  oz_df['group2'] <-oz_df['organization'] 
+} else{
+  oz_df['group2'] <-oz_df['group1'] 
+}
+oz_df <- oz_df %>% select(1,5)
+wweCalls3 <- wweCalls2 %>% 
+  left_join(oz_df,by=c('organization'='organization')) %>% 
+  mutate(group2=str_replace_all(group2,'&amp;','and'))
+```
+
+# Text Mining
+
+## Sentiment Analysis #1
+
+As for sentiment analysis, I first conducted a general one on all the sentences with the `Loughran and McDonald's lexicon`. My visualization is the sentiment trend line of people with different title in the company.
+
+```{r}
+wweCalls3$label <- seq.int(nrow(wweCalls3))
+songSentiment = sentiment(get_sentences(wweCalls3), 
+                          polarity_dt = hash_sentiment_loughran_mcdonald) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment = mean(sentiment))
+
+cleanLyrics = left_join(wweCalls3, songSentiment, by = "label")
+
+cleanLyrics %>% 
+  group_by(title1,date) %>% 
+  na.omit() %>% 
+  summarize(meanSentiment = mean(meanSentiment)) %>% 
+  ggplot(., aes(date, meanSentiment,color=title1)) + 
+  geom_smooth(se=F) +
+  theme_minimal()+
+  geom_hline(yintercept=0,size = 0.3,color="black")
+```
+
+<div class='blue'>
+We can see that the Management board's speeches are always more positive than others since they may need to show confience in their own companies and products to attract investors. 
+
+The sentiment score of the analyst are relatively stable overtime. It is because the analysts are only responsible for asking questions and there is no need for them to show many emotions. 
+
+Also, we notice that the sentiment in financial department leaders' speeches was negative for several years and has increased in recent year. My guess is that this sentiment variability is relavant to the stock market volatility. Also, the financial leader may be told to stay positive to attract more investors.
+</div>
+
+## Top N Analysis
+
+I extracted the Top 10 highest frequency words for each title to get a sense of the calls. 
+
+```{r}
+nrcWord <- textdata::lexicon_nrc()
+nrcValues <- lexicon::hash_sentiment_nrc
+nrcDominance <- textdata::lexicon_nrc_vad()
+
+# process the text(stopword, token, combine)
+wweCalls3$text <- wweCalls3$text %>% 
+  str_replace_all("-", "") %>% 
+  str_squish(.) %>% 
+  textstem::lemmatize_strings(.) %>% 
+  textclean::replace_contraction(.) %>% 
+  tm::removeWords(words = stopwords("en"))
+
+# top 10
+wweCalls_top <- wweCalls3 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  anti_join(stop_words) %>% 
+  group_by(title1) %>% 
+  count(word) %>% 
+  arrange(title1) %>% 
+  na.omit() %>% 
+  top_n(10)
+
+treemap(wweCalls_top,
+            index=c("title1","word"),
+            vSize="n",
+        title="Key words for different title", 
+        palette = "Set2",  
+            type="index"
+            )
+```
+
+<div class='blue'>
+In the calls, analysts are responsible for raising questions towards the company's problem. Therefore, it is not surprising that `question` is the word with highest frequency within analysts' speeches. 
+
+In addition, there are a lot of finance-related words in the speeches of financial leaders, such as million, revenue and increase. 
+
+Lastly, as for the company's management board, they are in charge of the whole company and what they care most is surely the development of the company. It is quite reasonable that they would mention words like growth and live frequently.
+</div>
+<br>
+Apart from the above Loughran and McDonald's lexicon, we choose `nrcDominance` this time to examine the valence score of words with top50 highest frequency for each title group. 
+
+```{r}
+wweCalls_top <- wweCalls_top %>% 
+  left_join(nrcDominance,by=c('word'='Word'))
+
+wweCalls_top_50 <- wweCalls3 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  anti_join(stop_words) %>% 
+  group_by(title1) %>% 
+  count(word) %>% 
+  arrange(title1) %>% 
+  na.omit() %>% 
+  top_n(300)%>% 
+  left_join(nrcDominance,by=c('word'='Word'))
+
+pirateplot(formula =  Valence ~ title1, #Formula
+   data = wweCalls_top_50, #Data frame
+   xlab = NULL, ylab = "Valence", #Axis labels
+   main = "Valence score for different title", #Plot title
+   pal = "google", #Color scheme
+   point.o = .2, #Points
+   avg.line.o = 1, #Turn on the Average/Mean line
+   theme = 0, #Theme
+   point.pch = 16, #Point `pch` type
+   point.cex = 1.5, #Point size
+   jitter.val = .1, #Turn on jitter to see the songs better
+   cex.lab = .9, cex.names = .7) #Axis label size
+```
+
+<div class='blue'>
+From the visualization, we can see that the distribution for financial leader group and the management group are very similar while there are some points with relatively lower valence scores in the analyst group. Analysts are always giving out challenging questions to the company. Therefore, it is inevitable that some questions may sound not very pleasant.
+
+Another finding is that the average valence score in the management group is slightly higher than the rest of the two groups. When management people start to talk, they may need to stay in a tone that is as positive (e.g. happy, cheerful, euphoric) as possible to cheer other people up.
+</div>
+
+## Sentiment Analysis #2
+
+I choose `trust` among the emotions in the nrc lexicons. I calculated the average valence score for all the trust words contained in each speech. 
+
+### Valence Score
+
+```{r}
+# select the emotion: trust
+trust <- nrcWord[nrcWord[,'sentiment']=='trust',]
+
+# join
+tokens = wweCalls3 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  inner_join(trust) %>% 
+  inner_join(nrcDominance,by=c('word'='Word')) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment = mean(Valence))
+  
+wweCalls4 <- wweCalls3 %>% 
+  left_join(tokens) %>% 
+  mutate(meanSentiment = ifelse(is.na(meanSentiment),0,meanSentiment),
+         year=format(as.Date(date, format="%d/%m/%Y"),"%Y"))
+
+# final output
+wweCalls_title <- wweCalls4 %>% 
+  group_by(title1) %>% 
+  summarize(meanSentiment = mean(meanSentiment))
+
+g <- wweCalls4 %>% 
+  mutate(title2=fct_reorder(title1,-meanSentiment)) %>% 
+  mutate(meanSentiment_all=mean(meanSentiment)) %>% 
+  group_by(title1) %>%
+  mutate(meanSentiment_g = mean(meanSentiment)) %>% 
+  ggplot(aes(text=paste("Name: ", name, "\n","Date: ", date, "\n", "Sentiment Score:",round(meanSentiment,2),"\n","Overall Avg:",round(meanSentiment_all,2),"\n","Title Avg:",round(meanSentiment_g,2)))) +
+  coord_flip() +
+  scale_colour_startrek()+
+  labs(x=NULL,y="Valence")+
+  theme(legend.position = "none",
+        axis.title= element_text(size=12),
+        axis.text.x= element_text(size =10),
+        panel.grid = element_blank(),
+        panel.background=element_rect(fill="white",color="grey50")) +
+  #geom_point(aes(region1,admission_rate,color= region1),size = 3, alpha = 0.15) +
+  geom_jitter(aes(title2,meanSentiment,color= title2),size=2,alpha = 0.13,width = 0.2) +
+  #stat_summary(aes(region1,admission_rate,color= region1),fun.y = mean, geom = 'point', size = 5)+
+  geom_point(aes(title2,meanSentiment_g,color=title2),size=5)+
+  geom_hline(aes(yintercept=meanSentiment_all),color="gray70",size = 0.6) +
+  geom_segment(aes(x = title2,xend=title2,y=meanSentiment_all,yend = meanSentiment_g,color = title2),size=0.8)+
+  ggtitle("Valence for people with different title")
+
+ggplotly(g,tooltip="text")
+```
+<br>
+<div class='blue'>
+The visualization is showing the valence score within each title group. Each small circles in the visual represents each speech delivered. There are a lot of zero points, which means there may be no word connected to `trust` emotion in that speech. Since it is an interactive graph, we can view the details of each point on hovering onto it. 
+
+In the visual, we can see that the management has a higher valence score when expressing the trust emotion. It may be resulted from the fact that the management board ought to stay as positive and happy as possible to give confidence to all the investors. Also, it may imply that the company's operation is in a relatively health condition. In addition, the analyst's words tend to have a lower valence score. The analysts may address some questions and problems with some negative words, and some analysis result from analysts may be not pleasant.
+</div>
+
+### Percentage
+
+```{r}
+#percentage that contains trust word
+wweCalls_title_per <- wweCalls4 %>% 
+  mutate(count = ifelse(meanSentiment==0, 0, 1)) %>% 
+  group_by(title1) %>% 
+  summarize(perSentiment = sum(count)/n())
+
+wweCalls_title_per %>%
+  ggplot( aes(title1, perSentiment, fill = title1)) +
+  geom_col() +
+  geom_hline(yintercept=0,size = 0.3,color="black")+
+  theme(plot.title = element_text(size = 11)) +
+  theme_minimal()
+```
+
+<div class='blue'>
+As mentioned above, there are many zero points indicating that there is no `trust` words in that speech. I decide to check the percentage of the speech containing a `trust` words among all the speeches. Our conclusion aligns with the one above -- the management group is highest while the analyst group is the lowest.
+</div>
+
+### Trend Line
+
+The visualization is about the valence score for all the `trust` words among all three title groups overtime. 
+
+```{r}
+wweCalls_title_date <- wweCalls4 %>% 
+  group_by(title1,date) %>% 
+  summarize(meanSentiment = mean(meanSentiment))
+
+wweCalls_title_date %>%
+  ggplot(aes(date, meanSentiment, color = title1)) +
+  geom_smooth(se=F)+
+  theme_minimal()
+```
+
+<div class='blue'>
+In general, we can see that from 2002 to 2019, the trend line has first declined and then increased. My guess is that it has something with the subprime crisis as well as financial crisis. 
+
+Also, we can tell that there is a gap between each two lines. The management board always has the highest valence score, and then the financial lead group following by the analyst group. It is consistent with our above conclusion that the management people tend to say words with stronger emotion.
+</div>
+
+# Stock price Analysis
+
+First of all, I use `alphavatager` package to get the full list of WWE's daily stock price.
+
+```{r}
+library(alphavantager)
+av_api_key("IGQ8SBW7F5DN58D8")
+full_list <- av_get(symbol = "WWE", av_fun = "TIME_SERIES_DAILY", interval = "daily", outputsize = "full")
+```
+
+Getting the closing stock price for the 10 trading days around each call's date, I was able to come up with an interactive visualization showing time series trend line under different sentiment scores with `plotly`.
+
+```{r}
+# join
+tokens1 = wweCalls3 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  inner_join(trust) %>% 
+  inner_join(nrcDominance,by=c('word'='Word')) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment = mean(Valence))
+  
+wweCalls5 <- wweCalls3 %>% 
+  inner_join(tokens1) %>% 
+  mutate(meanSentiment = ifelse(is.na(meanSentiment),0,meanSentiment),
+         year=format(as.Date(date, format="%d/%m/%Y"),"%Y"))
+
+wweCalls_date <- wweCalls5 %>% 
+  group_by(date) %>% 
+  summarize(meanSentiment = mean(meanSentiment)) %>% 
+  right_join(full_list,by=c('date'='timestamp'))
+
+temp2 <- list()
+i <- 1
+
+for (n in 1:length(which(!is.na(wweCalls_date$meanSentiment)))){
+  temp1 <- wweCalls_date[(which(!is.na(wweCalls_date$meanSentiment))[n]-5):(which(!is.na(wweCalls_date$meanSentiment))[n]+5),c('date','close','meanSentiment')]
+  temp1$date1 <- temp1$date[6]
+  temp1$date <- c(1:11)
+  temp1$meanSentiment <- temp1$meanSentiment[6]
+  temp2[[i]] <- temp1
+  i <- i+1
+}
+
+Combined <- do.call("rbind", temp2)
+
+
+tx <- highlight_key(Combined, ~date1)
+
+# initiate a plotly object
+base <- plot_ly(tx, color = I("black")) 
+
+time_series <- base %>%
+  group_by(date1) %>%
+  add_lines(x = ~date, y = ~close) %>% 
+  add_segments(x = 6, xend = 6, y = 8, yend = 20,color='red')%>% 
+  add_trace(x = ~date, y = ~close,tye = 'scatter', mode = 'markers', size=1)
+
+hist <- add_lines(base, x=~date1,y=~meanSentiment) %>% 
+  add_trace(base, x=~date1,y=~meanSentiment,type = 'scatter', mode = 'markers', size=1)
+
+subplot( hist, time_series, widths = c(.5, .5)) %>%
+  layout(barmode = "overlay", showlegend = FALSE) %>%
+  highlight(
+    dynamic = TRUE, 
+    selectize = TRUE, 
+    selected = attrs_selected(opacity = 0.3),)
+```
+
+<div class='blue'>
+The line graph on the left side is the average sentiment scores for each call's date and the one on the right side is the closing price for the 10 trading days around each call's date. I also added a red vertical line on the right visualization to represent the call's date. When we click on the sentiment scores on the left or the closing price trend line on the right, the selected call's date would be highlighted accordingly.
+
+The insight from the visualization is that, when the sentiment score is over **(0.78)**, the closing price trend line seems to have a slightly increase after the call (calls in Aug 2003, Aug 2008 and Nov 2010). 
+
+However, I am not very confident for the positive relationship between sentiment and closing price because the stock market would be affected by various elements and is so hard to predict overall.
+</div>
+
+# New Data Added
+
+## Data Processing
+
+There are two calls within the zip file that I did not use for the previous steps -- they are not already parsed. I would like to parse them, incorporate them into the rest of the data and determine if any new information comes to light. It's basically a big data wrangling assignment.
+
+```{r}
+raw27 <- read.csv(list.files(pattern = ".*raw.*27.*csv"),stringsAsFactors=F)
+raw28 <- read.csv(list.files(pattern = ".*raw.*28.*csv"),stringsAsFactors=F)
+
+people1 <- do.call('rbind',str_split(raw27[5:7,],'–')) %>% 
+  as.data.frame(stringsAsFactors=FALSE) 
+ 
+people1[3] <- people1[2]
+people1[2] <- 'WWE'
+colnames(people1) <- c('firstLast','organization','title')
+
+people2 <- do.call('rbind',str_split(raw27[9:14,],'–')) %>% 
+  as.data.frame(stringsAsFactors=FALSE) 
+people2[3] <- 'Analyst'
+colnames(people2) <- c('firstLast','organization','title')
+
+people3 <- do.call('rbind',str_split(raw28[12:13,],'-')) %>% 
+  as.data.frame(stringsAsFactors=FALSE) 
+people3[3] <- 'Analyst'
+colnames(people3) <- c('firstLast','organization','title')
+
+people <- rbind(people1,people2,people3) 
+people$firstLast <- gsub("\\s+$", "", people$firstLast)
+
+people[12,1] <- 'Operator'
+people[13,] <- people[9,]
+people[13,1] <- 'Robert Routh'
+people[,4] <- 1
+#d[c(T,F),]
+f5 <- data.frame()
+for (y in c(1,2)){
+  if (y==1){
+    e <- raw27[15:172,] %>% as.data.frame(stringsAsFactors=FALSE) %>% setNames('firstLast')
+  } else{
+    e <- raw28[15:134,] %>% as.data.frame(stringsAsFactors=FALSE) %>% setNames('firstLast')
+  }
+e$firstLast <- gsub("\\s+$", "", e$firstLast)
+
+f <- left_join(e,people[c(1,4)])
+
+g <- which(f[2]==1)
+
+h <- data.frame()
+i <- 1
+for (n in 1:(length(g))){
+  if (n<length(g)){
+    h[i,1] <- paste(sapply(f[as.integer(g[n]+1):as.integer(g[n+1]-1),1], paste, collapse=":"), collapse=" ")
+  } else {
+    h[i,1] <- paste(sapply(f[as.integer(g[n]+1):nrow(f),1], paste, collapse=":"), collapse=" ")
+  }
+  i <- i+1
+}
+f1 <- f %>% 
+  filter(V4 == 1) %>% select(1)
+f2 <- cbind(f1,h)
+
+f3 <- f2 %>% 
+  left_join(people)
+
+  if (y==1){
+    f3['quarter'] <- substring(raw27[2,1],1,2)
+    f3['date'] <- str_extract(raw27[3,1], "\\w+\\s\\d{1,2}.*\\d{4}")
+  } else{
+    f3['quarter'] <- substring(raw28[2,1],1,2)
+    f3['date'] <- str_extract(raw28[3,1], "\\w+\\s\\d{1,2}.*\\d{4}")
+  }
+f3['gender'] <- NA
+f3['likelyRace'] <- NA
+f3['likelyRaceProb'] <- NA
+f3['ticker'] <- 'WWE'
+f3['firstName'] <- str_extract(f3[,1], "^\\w+\\s")
+f3['name'] <- f3['firstLast']
+f4 <- f3 %>% 
+  select(name,firstName,firstLast,organization,title,V1,gender,likelyRace,likelyRaceProb,ticker,date,quarter) %>% 
+  rename('text'='V1') %>% 
+  mutate(quarter=as.numeric(substr(quarter,2,2)),
+         date=as.Date(date,'%b %d, %Y'),)
+f5 <- rbind(f5,f4)
+}
+
+wweCallsN <- rbind(f5,wweCalls1)
+# may want to drop the operators
+wweCallsN <- wweCallsN %>% 
+  filter(firstName!='Operator')%>% 
+  filter(title!='Media')
+
+# title
+wweCallsN2 <- wweCallsN %>% 
+  mutate(title1=ifelse(grepl('VP|Planning|IR|CFO|Financial', title),'Financial Lead',ifelse(grepl('Analyst',title),'Analyst','Management')))
+```
+
+## Top N Analysis (New)
+
+```{r}
+# process the text(stopword, token, combine)
+wweCallsN2$text <- wweCallsN2$text %>% 
+  str_replace_all("-", "") %>% 
+  str_squish(.) %>% 
+  textstem::lemmatize_strings(.) %>% 
+  textclean::replace_contraction(.) %>% 
+  tm::removeWords(words = stopwords("en"))
+
+wweCallsN2$label <- seq.int(nrow(wweCallsN2))
+
+wweCallsN_top_50 <- wweCallsN2 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  anti_join(stop_words) %>% 
+  group_by(title1) %>% 
+  count(word) %>% 
+  arrange(title1) %>% 
+  na.omit() %>% 
+  top_n(300)%>% 
+  left_join(nrcDominance,by=c('word'='Word'))
+
+pirateplot(formula =  Valence ~ title1, #Formula
+   data = wweCalls_top_50, #Data frame
+   xlab = NULL, ylab = "Valence", #Axis labels
+   main = "Valence score for different title", #Plot title
+   pal = "google", #Color scheme
+   point.o = .2, #Points
+   avg.line.o = 1, #Turn on the Average/Mean line
+   theme = 0, #Theme
+   point.pch = 16, #Point `pch` type
+   point.cex = 1.5, #Point size
+   jitter.val = .1, #Turn on jitter to see the songs better
+   cex.lab = .9, cex.names = .7) #Axis label size
+```
+
+<div class='blue'>
+This graph about the valence score within each title group does not change by adding new data.
+</div>
+
+## Sentiment Analysis (New)
+
+### Valence Score
+
+```{r}
+# join
+tokens = wweCallsN2 %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  inner_join(trust) %>% 
+  inner_join(nrcDominance,by=c('word'='Word')) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment = mean(Valence))
+  
+wweCallsN3 <- wweCallsN2 %>% 
+  left_join(tokens) %>% 
+  mutate(meanSentiment = ifelse(is.na(meanSentiment),0,meanSentiment),
+         year=format(as.Date(date, format="%d/%m/%Y"),"%Y"))
+
+# final output
+wweCallsN_title <- wweCallsN3 %>% 
+  group_by(title1) %>% 
+  summarize(meanSentiment = mean(meanSentiment))
+  
+set.seed(123)
+g <- wweCallsN3 %>% 
+  mutate(title2=fct_reorder(title1,-meanSentiment)) %>% 
+  mutate(meanSentiment_all=mean(meanSentiment)) %>% 
+  group_by(title1) %>%
+  mutate(meanSentiment_g = mean(meanSentiment)) %>% 
+  ggplot(aes(text=paste("Name: ", name, "\n","Date: ", date, "\n", "Sentiment Score:",round(meanSentiment,2),"\n","Overall Avg:",round(meanSentiment_all,2),"\n","Title Avg:",round(meanSentiment_g,2)))) +
+  coord_flip() +
+  scale_colour_startrek()+
+  labs(x=NULL,y="Valence")+
+  theme(legend.position = "none",
+        axis.title= element_text(size=12),
+        axis.text.x= element_text(size =10),
+        panel.grid = element_blank(),
+        panel.background=element_rect(fill="white",color="grey50")) +
+  #geom_point(aes(region1,admission_rate,color= region1),size = 3, alpha = 0.15) +
+  geom_jitter(aes(title2,meanSentiment,color= title2),size=2,alpha = 0.13,width = 0.2) +
+  #stat_summary(aes(region1,admission_rate,color= region1),fun.y = mean, geom = 'point', size = 5)+
+  geom_point(aes(title2,meanSentiment_g,color=title2),size=5)+
+  geom_hline(aes(yintercept=meanSentiment_all),color="gray70",size = 0.6) +
+  geom_segment(aes(x = title2,xend=title2,y=meanSentiment_all,yend = meanSentiment_g,color = title2),size=0.8)+
+  ggtitle("Valence for people with different title")
+
+ggplotly(g,tooltip="text")
+```
+<br>
+<div class='blue'>
+This graph does not change much besides the average valence score of the financial lead group increased **from 0.44(below average) to 0.46(above average)**. It means that the raw data we added contains many speeches from the financial leaders with higher `trust` emotion.
+</div>
+
+### Percentage
+
+```{r}
+#percentage that contains trust word
+wweCallsN_title_per <- wweCallsN3 %>% 
+  mutate(count = ifelse(meanSentiment==0, 0, 1)) %>% 
+  group_by(title1) %>% 
+  summarize(perSentiment = sum(count)/n())
+
+wweCallsN_title_per %>%
+  ggplot( aes(title1, perSentiment, fill = title1)) +
+  geom_col() +
+  geom_hline(yintercept = 0, size=0.3,color = "black") +
+  theme(plot.title = element_text(size = 11)) +
+  theme_minimal()
+```
+
+<div class='blue'>
+By adding new raw data to our original dataset, we can see that the proportion of the speech containing `trust` words has increased. However, the ranking among three title groups has not changed.
+</div>
+
+### Trend Line
+
+```{r}
+wweCallsN_title_date <- wweCallsN3 %>% 
+  group_by(title1,date) %>% 
+  summarize(meanSentiment = mean(meanSentiment))
+
+wweCallsN_title_date %>%
+  ggplot(aes(date, meanSentiment, color = title1)) +
+  geom_smooth(se=F)+
+  theme_minimal()
+```
+
+<div class='blue'>
+Wow, there is a big different here! Instead of having low valence score all the time, the analyst group would have giant jump between 2010 and 2015. Since I do not know much about WWE, my assumption is that there may be a big and profitable event/competition ongoing during that period, which leads most of the analysts to hold a positive attitule towards the company.
+
+However, we should also notice that there are missing call records between 2010 and 2016. We should collect more data during that period to make our smooth line more accurate.
+</div>
